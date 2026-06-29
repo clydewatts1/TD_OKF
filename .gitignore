@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ignore .env file for local development
+.env
+# ignore okf_bundle directory and everything under it
+okf_bundle/
