@@ -1,2 +1,135 @@
 # TD_OKF
-Teradata Open Knowledge Format Extractor
+
+Teradata Open Knowledge Format (OKF) Extractor.
+
+This project runs a small pipeline of Python scripts that:
+
+1. Collect table row counts and size metrics from Teradata.
+2. Collect column type metadata.
+3. Generate an OKF Markdown bundle in the `okf_bundle` folder.
+
+## Project Structure
+
+- `sandbox/row_count.py`: Builds or refreshes table-level metrics in Teradata.
+- `sandbox/data_type.py`: Builds or refreshes column type metadata.
+- `sandbox/otk_generator.py`: Generates Markdown output in `okf_bundle/`.
+- `env_sample`: Template for required environment variables.
+
+## Prerequisites
+
+- Python 3.10+ recommended.
+- Network access to your Teradata environment.
+- Teradata permissions to read metadata views and write to the configured sandbox database.
+
+## Setup
+
+### 1. Create and activate a virtual environment
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+Windows Git Bash:
+
+```bash
+python -m venv .venv
+source .venv/Scripts/activate
+```
+
+### 2. Install dependencies
+
+```bash
+pip install teradatasql python-dotenv
+```
+
+## Configure .env
+
+### 1. Create a local .env file from the template
+
+```bash
+cp env_sample .env
+```
+
+If `cp` is not available, copy `env_sample` manually and name it `.env`.
+
+### 2. Set the values in .env
+
+Required keys:
+
+- `TERADATA_HOST`: Teradata host name.
+- `TERADATA_LOGMECH`: Login mechanism, for example `TD2` or `BROWSER`.
+- `TERADATA_USER`: Username (not required for `BROWSER` SSO).
+- `TERADATA_PASSWORD`: Password (not required for `BROWSER` SSO).
+- `SOURCE_DATABASE_PATTERN`: Source database filter, for example `DWP01%_ACC_ORR%`.
+- `SOURCE_TABLE_PATTERN`: Source table filter, for example `%`.
+- `DATABASE_METADATA`: Target metadata database where helper tables are stored.
+- `TABLE_ROW_COUNT`: Target table name for row-count and size metrics.
+- `TABLE_COLUMN_TYPE`: Target table name for column type metadata.
+
+## Run Order
+
+Run scripts in this order from the repository root:
+
+### 1. Row counts and table sizes
+
+```bash
+python sandbox/row_count.py
+```
+
+What it does:
+
+- Connects to Teradata.
+- Ensures the row-count metrics table exists in `DATABASE_METADATA`.
+- Populates or refreshes metrics in `TABLE_ROW_COUNT`.
+
+### 2. Column types metadata
+
+```bash
+python sandbox/data_type.py
+```
+
+What it does:
+
+- Populates or refreshes column metadata used by the final OKF generation step.
+- Writes data to the table configured in `TABLE_COLUMN_TYPE`.
+
+### 3. Generate OKF bundle
+
+```bash
+python sandbox/otk_generator.py
+```
+
+What it does:
+
+- Reads source metadata plus the two helper tables.
+- Produces Markdown files in `okf_bundle/`.
+- Generates index files including `okf_bundle/index.md`.
+
+## Output
+
+Expected generated folder:
+
+- `okf_bundle/index.md`
+- `okf_bundle/tables/<database>/index.md`
+- `okf_bundle/tables/<database>/<table>.md`
+
+## General Usage Notes
+
+- Use narrow filters in `SOURCE_DATABASE_PATTERN` and `SOURCE_TABLE_PATTERN` first, then widen scope.
+- For browser SSO, set `TERADATA_LOGMECH=BROWSER`.
+- Keep `.env` out of version control.
+- Re-run the scripts whenever metadata needs refreshing.
+
+## Troubleshooting
+
+- Connection failed:
+	- Check `TERADATA_HOST`, `TERADATA_LOGMECH`, credentials, VPN, and firewall access.
+- Missing table or permission errors:
+	- Verify write access to `DATABASE_METADATA` and read access to Teradata system views.
+- Empty output bundle:
+	- Confirm patterns in `SOURCE_DATABASE_PATTERN` and `SOURCE_TABLE_PATTERN` match real objects.
+- Python package import errors:
+	- Activate `.venv` and reinstall dependencies.

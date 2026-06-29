@@ -1,0 +1,9 @@
+TERADATA_HOST=<database_host>
+TERADATA_LOGMECH=<logon_mechanism>
+TERADATA_USER=<username>
+TERADATA_PASSWORD=<password>
+SOURCE_DATABASE_PATTERN=DWP01%_ACC_ORR%
+SOURCE_TABLE_PATTERN=%
+DATABASE_METADATA=<metadata_database>
+TABLE_ROW_COUNT=<table_row_count>
+TABLE_COLUMN_TYPE=<table_column_type>
