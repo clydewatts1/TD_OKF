@@ -7,3 +7,4 @@ SOURCE_TABLE_PATTERN=%
 DATABASE_METADATA=<metadata_database>
 TABLE_ROW_COUNT=<table_row_count>
 TABLE_COLUMN_TYPE=<table_column_type>
+OKF_DIRECTORY=okf_bundle

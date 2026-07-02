@@ -68,6 +68,7 @@ Required keys:
 - `DATABASE_METADATA`: Target metadata database where helper tables are stored.
 - `TABLE_ROW_COUNT`: Target table name for row-count and size metrics.
 - `TABLE_COLUMN_TYPE`: Target table name for column type metadata.
+- `OKF_DIRECTORY`: Output root directory for generated OKF files.
 
 ## Run Order
 
@@ -102,11 +103,44 @@ What it does:
 python sandbox/otk_generator.py
 ```
 
+You can override any supported setting at runtime using uppercase CLI flags.
+Flag names match `.env` keys.
+
+Examples:
+
+```bash
+python sandbox/otk_generator.py --OKF_DIRECTORY okf_primark
+```
+
+```bash
+python sandbox/otk_generator.py --SOURCE_DATABASE_PATTERN DWP01A_ACC_ORR% --SOURCE_TABLE_PATTERN BACK_FEED% --OKF_DIRECTORY okf_primark
+```
+
+Configuration precedence is:
+
+1. CLI flag value
+2. `.env` value
+3. Script default
+
+Supported CLI override flags:
+
+- `--TERADATA_HOST`
+- `--TERADATA_LOGMECH`
+- `--TERADATA_USER`
+- `--TERADATA_PASSWORD`
+- `--SOURCE_DATABASE_PATTERN`
+- `--SOURCE_TABLE_PATTERN`
+- `--DATABASE_METADATA`
+- `--TABLE_ROW_COUNT`
+- `--TABLE_COLUMN_TYPE`
+- `--OKF_DIRECTORY`
+
 What it does:
 
 - Reads source metadata plus the two helper tables.
-- Produces Markdown files in `okf_bundle/`.
-- Generates index files including `okf_bundle/index.md`.
+- Produces Markdown files in `OKF_DIRECTORY` (default `okf_bundle/`).
+- Generates index files including `OKF_DIRECTORY/index.md`.
+- Builds a master index with quick database links and per-database summary counts.
 
 ## Output
 

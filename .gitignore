@@ -221,3 +221,5 @@ __marimo__/
 .env
 # ignore okf_bundle directory and everything under it
 okf_bundle/
+okf_bundle_acc_orr/
+okf_bundle_acc_cli_test/

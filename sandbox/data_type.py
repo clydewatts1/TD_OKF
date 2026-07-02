@@ -1,308 +1,301 @@
 import os
 import sys
-from datetime import datetime, timezone
-from collections import defaultdict
+from datetime import datetime
+import re
 import teradatasql
 from dotenv import load_dotenv
 
 # Load configuration properties from the environment file
 load_dotenv()
 
+# Retrieve values with safety fallbacks
 TD_HOST = os.getenv("TERADATA_HOST")
 TD_USER = os.getenv("TERADATA_USER")
 TD_PASSWORD = os.getenv("TERADATA_PASSWORD")
 TD_LOGMECH = os.getenv("TERADATA_LOGMECH", "TD2")
-SOURCE_DB_PATTERN = os.getenv("SOURCE_DATABASE_PATTERN", "%")
+SOURCE_DB_PATTERN = os.getenv("SOURCE_DATABASE_PATTERN", "DWP01%")
 SOURCE_TABLE_PATTERN = os.getenv("SOURCE_TABLE_PATTERN", "%")
 TARGET_DB = os.getenv("DATABASE_METADATA", "DWB02T_SANDBOX")
-TABLE_METRICS = os.getenv("TABLE_ROW_COUNT", "table_size_metrics")
-COLUMN_METRICS =  os.getenv("TABLE_COLUMN_TYPE", "table_column_types")
+TARGET_TABLE = os.getenv("TABLE_COLUMN_TYPE", "table_column_types")
 
-OUTPUT_DIR = "okf_bundle"
-TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
+# Check for browser-based Single Sign-On (SSO) bypass configurations
 IS_BROWSER_AUTH = TD_LOGMECH.upper() in ["BROWSER", "BROWER"]
 
+def is_connection_closed_error(err):
+    return "connection is already closed" in str(err).lower()
+
 def get_teradata_connection():
+    """
+    Establishes and returns a connection to Teradata database using teradatasql.
+    Supports Single Sign-On browser authentication bypass.
+    """
     try:
-        print(f"Connecting to Teradata host '{TD_HOST}'...")
+        print(f"Connecting to Teradata host '{TD_HOST}' using mechanism '{TD_LOGMECH}'...")
         if IS_BROWSER_AUTH:
-            return teradatasql.connect(host=TD_HOST, logmech=TD_LOGMECH)        
+            conn = teradatasql.connect(host=TD_HOST, logmech=TD_LOGMECH)        
         else:
-            return teradatasql.connect(host=TD_HOST, user=TD_USER, password=TD_PASSWORD, logmech=TD_LOGMECH)
+            conn = teradatasql.connect(host=TD_HOST, user=TD_USER, password=TD_PASSWORD, logmech=TD_LOGMECH)
+        print("Connected successfully to Teradata Database!")
+        return conn
     except Exception as e:
-        print(f"Connection failed: {e}")
+        print(f"Failed to connect to Teradata database: {e}")
         sys.exit(1)
 
-def fetch_master_metadata(cursor):
+def initialize_target_table(cursor):
     """
-    Executes the mega-join query to pull all table and column metadata, 
-    including metrics and OKF data types from our sandbox tables.
+    Ensures that the tracking target table exists.
+    Created dynamically with proper column types including new Description and Nullable fields.
     """
-    print("Extracting master schema, descriptions, and metrics...")
+    full_target_name = f'"{TARGET_DB}"."{TARGET_TABLE}"'
+    
+    create_table_ddl = f"""
+    CREATE SET TABLE {full_target_name} , NO FALLBACK ,
+         NO BEFORE JOURNAL,
+         NO AFTER JOURNAL,
+         CHECKSUM = DEFAULT,
+         DEFAULT MERGEBLOCKRATIO
+         (
+          DatabaseName VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC,
+          TableName VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC,
+          ColumnName VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC,
+          ColumnOrder INTEGER,
+          TeradataDataType VARCHAR(256) CHARACTER SET UNICODE,
+          OKFDataType VARCHAR(64) CHARACTER SET UNICODE,
+          IsNullable VARCHAR(5) CHARACTER SET LATIN,
+          ColumnDescription VARCHAR(500) CHARACTER SET UNICODE,
+            ErrorCode INTEGER,
+            ErrorDescription VARCHAR(1000) CHARACTER SET UNICODE,
+          ExtractionTimestamp TIMESTAMP(6)
+         )
+    PRIMARY INDEX ( DatabaseName , TableName , ColumnName );
+    """
+    
+    try:
+        check_query = """
+        SELECT 1 
+        FROM DBC.TablesV 
+        WHERE UPPER(DatabaseName) = UPPER(?) 
+          AND UPPER(TableName) = UPPER(?)
+        """
+        cursor.execute(check_query, [TARGET_DB, TARGET_TABLE])
+        
+        if cursor.fetchone():
+            print(f"Target catalog table {full_target_name} exists.")
+        else:
+            print(f"Target table {full_target_name} not found. Executing DDL now...")
+            cursor.execute(create_table_ddl)
+            print("Target catalog table created successfully.")
+    except Exception as e:
+        if "3803" in str(e):
+            print(f"Target table {full_target_name} is already present.")
+        else:
+            print(f"Error checking/creating target catalog table: {e}")
+            raise
+
+    required_columns = {
+        "DatabaseName": "VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC",
+        "TableName": "VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC",
+        "ColumnName": "VARCHAR(128) CHARACTER SET UNICODE NOT CASESPECIFIC",
+        "ColumnOrder": "INTEGER",
+        "TeradataDataType": "VARCHAR(256) CHARACTER SET UNICODE",
+        "OKFDataType": "VARCHAR(64) CHARACTER SET UNICODE",
+        "IsNullable": "VARCHAR(5) CHARACTER SET LATIN",
+        "ColumnDescription": "VARCHAR(500) CHARACTER SET UNICODE",
+        "ErrorCode": "INTEGER",
+        "ErrorDescription": "VARCHAR(1000) CHARACTER SET UNICODE",
+        "ExtractionTimestamp": "TIMESTAMP(6)",
+    }
+
+    try:
+        cursor.execute(
+            """
+            SELECT ColumnName
+            FROM DBC.ColumnsV
+            WHERE UPPER(DatabaseName) = UPPER(?)
+              AND UPPER(TableName) = UPPER(?)
+            """,
+            [TARGET_DB, TARGET_TABLE],
+        )
+        existing_columns = {row[0].upper() for row in cursor.fetchall()}
+
+        for column_name, column_ddl in required_columns.items():
+            if column_name.upper() not in existing_columns:
+                print(f"Adding missing column {column_name} to {full_target_name}...")
+                cursor.execute(f'ALTER TABLE {full_target_name} ADD {column_name} {column_ddl};')
+    except Exception as e:
+        print(f"Error validating or updating target catalog table schema: {e}")
+        raise
+
+def map_resolved_type_to_okf(resolved_type):
+    """
+    Translates a fully resolved Teradata SQL Type string to an OKF schema type.
+    """
+    type_str = resolved_type.strip().upper() if resolved_type else ""
+    
+    if 'CHAR' in type_str or 'CLOB' in type_str or 'JSON' in type_str:
+        return 'string'
+    elif 'INT' in type_str or 'BYTEINT' in type_str:
+        return 'integer'
+    elif 'DECIMAL' in type_str or 'NUMERIC' in type_str or 'FLOAT' in type_str or 'DOUBLE' in type_str:
+        return 'number'
+    elif 'TIMESTAMP' in type_str:
+        return 'datetime'
+    elif 'TIME' in type_str:
+        return 'time'
+    elif 'DATE' in type_str:
+        return 'date'
+    elif 'BYTE' in type_str or 'BLOB' in type_str:
+        return 'string'
+        
+    return 'any'
+
+def fetch_source_columns(cursor):
+    """
+    Extracts structural column order, descriptions, and nullable flags using Windowed ranking.
+    """
+    print(f"Extracting structural metadata matching database: '{SOURCE_DB_PATTERN}'...")
+    full_target_name = f'"{TARGET_DB}"."{TARGET_TABLE}"'
     query = f"""
     SELECT 
-        C.DatabaseName, C.TableName, C.ColumnName, T.TableKind,
-        COALESCE(T.CommentString, '') AS TableDescription,
-        COALESCE(C.CommentString, '') AS ColumnDescription,
-        C.Nullable, COALESCE(SZ.TableSizeBytes, 0) AS TableSizeBytes,
-        COALESCE(SZ.RowCount, 0) AS RowCount, TP.TeradataDataType,
-        TP.OKFDataType,
-        COALESCE(C.PartitioningColumn, 'N') AS PartitioningColumn,
-        ROW_NUMBER() OVER (PARTITION BY C.DatabaseName, C.TableName ORDER BY C.ColumnId) AS ColumnOrder
-    FROM DBC.TablesV AS T
-    INNER JOIN DBC.ColumnsV AS C
-        ON T.DatabaseName = C.DatabaseName AND T.TableName = C.TableName
-    LEFT OUTER JOIN "{TARGET_DB}"."{TABLE_METRICS}" AS SZ
-        ON T.DatabaseName = SZ.DatabaseName AND T.TableName = SZ.TableName
-    LEFT OUTER JOIN "{TARGET_DB}"."{COLUMN_METRICS}" AS TP
-        ON C.DatabaseName = TP.DatabaseName AND C.TableName = TP.TableName AND C.ColumnName = TP.ColumnName
-    WHERE T.DatabaseName LIKE ? AND T.TableName LIKE ?
+        C.DatabaseName, 
+        C.TableName, 
+        C.ColumnName, 
+        ROW_NUMBER() OVER (PARTITION BY C.DatabaseName, C.TableName ORDER BY C.ColumnId) as ColumnOrder,
+        COALESCE(C.CommentString, 'No description provided') AS ColumnDescription,
+        C.Nullable
+    FROM DBC.ColumnsV AS C
+    INNER JOIN DBC.TablesV AS T 
+      ON C.DatabaseName = T.DatabaseName 
+      AND C.TableName = T.TableName
+    LEFT OUTER JOIN  {full_target_name} AS M
+      ON C.DatabaseName = M.DatabaseName
+        AND C.TableName = M.TableName
+        AND C.ColumnName = M.ColumnName
+    WHERE C.DatabaseName LIKE ?
+      AND C.TableName LIKE ?
       AND T.TableKind IN ('T', 'O', 'V')
-    ORDER BY C.DatabaseName, C.TableName, ColumnOrder;
+      /* Only include columns that are not already present in the target table */
+    QUALIFY MAX(CASE WHEN M.ColumnName IS NULL THEN 1 ELSE 0 END) OVER (PARTITION BY C.DatabaseName, C.TableName) = 1
+    ORDER BY C.DatabaseName, C.TableName, ColumnOrder
     """
     try:
         cursor.execute(query, [SOURCE_DB_PATTERN, SOURCE_TABLE_PATTERN])
         return cursor.fetchall()
     except Exception as e:
-        print(f"Error reading master metadata: {e}")
+        print(f"Error querying column definitions from DBC: {e}")
         return []
 
-def fetch_indices(cursor):
-    """Fetches Primary Key (K) and Primary Index (P, Q) details."""
-    print("Extracting index definitions...")
-    query = """
-    SELECT DatabaseName, TableName, IndexType, UniqueFlag, ColumnName
-    FROM DBC.IndicesV
-    WHERE DatabaseName LIKE ? AND TableName LIKE ?
-      AND IndexType IN ('P', 'Q', 'K')
-    ORDER BY DatabaseName, TableName, IndexNumber, ColumnPosition;
+def fetch_column_type(cursor, db_name, tbl_name, col_name):
     """
-    try:
-        cursor.execute(query, [SOURCE_DB_PATTERN, SOURCE_TABLE_PATTERN])
-        return cursor.fetchall()
-    except Exception as e:
-        print(f"Error reading indices: {e}")
-        return []
-
-def fetch_table_ddl(cursor, db_name, tbl_name, table_kind):
-    """Executes SHOW TABLE or SHOW VIEW to get the exact DDL."""
-    clean_kind = table_kind.strip().upper()
-    command = "SHOW VIEW" if clean_kind == 'V' else "SHOW TABLE"
-    query = f'{command} "{db_name}"."{tbl_name}";'
+    Dynamic 0-row Type() extraction. Perfectly handles Views.
+    """
+    query = f"""
+    SELECT TYPE(COL)
+    FROM (SELECT DISTINCT 1 AS One FROM DBC.dbcinfo) AS B 
+    LEFT OUTER JOIN
+    (SELECT "{col_name}" AS COL FROM "{db_name}"."{tbl_name}" WHERE 1 <> 1) AS A
+    ON 1=1
+    """
     try:
         cursor.execute(query)
         result = cursor.fetchone()
-        ddl_text = result[0].replace('\r', '\n') if result else ""
-        
-        return ddl_text
+        return (result[0] if result else "UNKNOWN", None, None)
     except Exception as e:
-        # Fails gracefully if user doesn't have SHOW privileges
-        return ""
+        if is_connection_closed_error(e):
+            raise
+        err_text = str(e)
+        match = re.search(r"Error\s+(\d+)", err_text)
+        err_code = int(match.group(1)) if match else None
+        err_desc = err_text.splitlines()[0] if err_text else "Unknown error"
+        print(f"Warning: Could not resolve type for {db_name}.{tbl_name}.{col_name}: {err_desc}")
+        return "UNKNOWN", err_code, err_desc
 
-def generate_okf_markdown(info, columns, indices, ddl):
-    """Constructs the OKF v0.1 compliant Markdown file string."""
-    
-    db_name, tbl_name = info['db'], info['table']
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    clean_type = info['type'].strip().upper()
-    
-    # Map Table Kind
-    type_map = {'T': 'Standard Table', 'O': 'Queue Table', 'V': 'View'}
-    obj_type = type_map.get(clean_type, 'Unknown')
+def delete_existing_metrics(cursor, db_name, tbl_name):
+    delete_sql = f'DELETE FROM "{TARGET_DB}"."{TARGET_TABLE}" WHERE UPPER(DatabaseName) = UPPER(?) AND UPPER(TableName) = UPPER(?)'
+    try:
+        cursor.execute(delete_sql, [db_name, tbl_name])
+    except Exception as e:
+        if is_connection_closed_error(e):
+            raise
+        print(f"Warning: Could not clear previous metadata for {db_name}.{tbl_name}: {e}")
 
-    # Parse Indexes into printable strings
-    pk_cols = [c for t, u, c in indices if t == 'K']
-    pi_cols = [c for t, u, c in indices if t in ('P', 'Q')]
-    is_unique_pi = any(u == 'Y' for t, u, c in indices if t == 'Q')
-    part_cols = [col['name'] for col in columns if col['is_partition'] == 'Y']
-    
-    pk_str = f"`{', '.join(pk_cols)}`" if pk_cols else "None"
-    pi_type = "Unique Primary Index" if is_unique_pi else "Non-Unique Primary Index" if pi_cols else "No Primary Index"
-    pi_str = f"{pi_type} on `{', '.join(pi_cols)}`" if pi_cols else pi_type
-    part_str = f"`{', '.join(part_cols)}`" if part_cols else "None"
-
-    rows_str = "Unknown" if clean_type == 'V' else f"{info['rows']:,}"
-    size_str = "Unknown" if clean_type == 'V' else f"{info['size']:,}"
-
-    # Handle YAML safe description for frontmatter (omit entirely if empty)
-    yaml_desc_line = ""
-    if info['desc']:
-        safe_desc = info['desc'].replace('"', '\\"')
-        yaml_desc_line = f'description: "{safe_desc}"\n'
-
-    # Handle Human Readable description for markdown body
-    tbl_desc = info['desc'] if info['desc'] else "No description provided."
-
-    # Build Frontmatter
-    md = f"""---
-type: Teradata Table
-title: "{db_name}.{tbl_name}"
-{yaml_desc_line}tags:
-  - {db_name}
-  - teradata
-  - {obj_type.lower().replace(' ', '_')}
-timestamp: {current_time}
----
-
-# {db_name}.{tbl_name}
-
-**Database:** `{db_name}`  
-**Object Type:** `{obj_type} ({clean_type})`  
-**Description:** {tbl_desc}  
-**Rows:** `{rows_str}`  
-**Size (Bytes):** `{size_str}`  
-
-**Primary Key:** {pk_str}  
-**Primary Index:** {pi_str}  
-**Partition Columns:** {part_str}
-
-## Schema
-
-| Column Name | Teradata Type | OKF Type | Nullable | Description | Order |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-"""
-    # Build Schema Table
-    for col in columns:
-        is_null = "True" if col['nullable'] == 'Y' else "False"
-        td_type = col['td_type'] if col['td_type'] else 'UNKNOWN'
-        okf_type = col['okf_type'] if col['okf_type'] else 'any'
-        
-        desc = col['desc'].replace('\n', ' ').replace('\r', '').replace('|', '\\|') if col['desc'] else ''
-        
-        md += f"| `{col['name']}` | `{td_type}` | `{okf_type}` | `{is_null}` | {desc} | {col['order']} |\n"
-
-    # Append DDL
-    if ddl:
-        md += f"\n## Teradata DDL\n\n```sql\n{ddl}\n```\n"
-
-    return md
-
-def generate_bundle_indices(tables, output_dir, tables_dir):
-    """Generates the root index.md and individual database index.md files."""
-    print("Generating OKF index files...")
-    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    
-    # Group tables by database for the index
-    db_map = defaultdict(list)
-    for (db, tbl), data in tables.items():
-        db_map[db].append((tbl, data['info']['type'], data['info']['desc']))
-        
-    # 1. Generate the Master Index (Root)
-    master_md = f"""---
-type: Bundle
-title: "Teradata Metadata Bundle"
-description: "Master index of all extracted Teradata tables and views."
-timestamp: {current_time}
----
-
-# Teradata Metadata Bundle
-
-This bundle contains metadata extracted from Teradata, organized by database.
-
-"""
-    for db in sorted(db_map.keys()):
-        safe_db = db.replace(" ", "_").replace('"', '')
-        # Link the database header to its specific sub-index
-        master_md += f"## Database: [{db}](tables/{safe_db}/index.md)\n\n"
-        master_md += "| Object Name | Type | Description |\n"
-        master_md += "| :--- | :--- | :--- |\n"
-        for tbl, tkind, desc in sorted(db_map[db]):
-            safe_tbl = tbl.replace(" ", "_").replace('"', '')
-            clean_type = tkind.strip().upper()
-            type_map = {'T': 'Table', 'O': 'Queue Table', 'V': 'View'}
-            obj_type = type_map.get(clean_type, 'Unknown')
-            
-            clean_desc = desc.replace('\n', ' ').replace('\r', '').replace('|', '\\|') if desc else 'No description provided.'
-            
-            master_md += f"| [{tbl}](tables/{safe_db}/{safe_tbl}.md) | `{obj_type}` | {clean_desc} |\n"
-        master_md += "\n"
-        
-    master_index_path = os.path.join(output_dir, "index.md")
-    with open(master_index_path, 'w', encoding='utf-8') as f:
-        f.write(master_md)
-
-    # 2. Generate the Database-Level Indexes
-    for db in sorted(db_map.keys()):
-        safe_db = db.replace(" ", "_").replace('"', '')
-        db_dir = os.path.join(tables_dir, safe_db)
-        os.makedirs(db_dir, exist_ok=True)
-        
-        db_md = f"""---
-type: Collection
-title: "Database {db}"
-description: "Index of tables and views in the {db} database."
-timestamp: {current_time}
----
-
-# Database: {db}
-
-| Object Name | Type | Description |
-| :--- | :--- | :--- |
-"""
-        for tbl, tkind, desc in sorted(db_map[db]):
-            safe_tbl = tbl.replace(" ", "_").replace('"', '')
-            clean_type = tkind.strip().upper()
-            type_map = {'T': 'Table', 'O': 'Queue Table', 'V': 'View'}
-            obj_type = type_map.get(clean_type, 'Unknown')
-            clean_desc = desc.replace('\n', ' ').replace('\r', '').replace('|', '\\|') if desc else 'No description provided.'
-            
-            # Since this index is in the same folder as the tables, the link is just the filename
-            db_md += f"| [{tbl}]({safe_tbl}.md) | `{obj_type}` | {clean_desc} |\n"
-            
-        db_index_path = os.path.join(db_dir, "index.md")
-        with open(db_index_path, 'w', encoding='utf-8') as f:
-            f.write(db_md)
+def insert_column_record(cursor, db_name, tbl_name, col_name, col_order, resolved_type, okf_type, is_nullable, col_desc, err_code, err_desc):
+    """
+    Saves mapped column record into the metadata tracking database.
+    """
+    insert_sql = f"""
+    INSERT INTO "{TARGET_DB}"."{TARGET_TABLE}" 
+    (DatabaseName, TableName, ColumnName, ColumnOrder, TeradataDataType, OKFDataType, IsNullable, ColumnDescription, ErrorCode, ErrorDescription, ExtractionTimestamp)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """
+    timestamp = datetime.now()
+    try:
+        cursor.execute(insert_sql, [
+            db_name, tbl_name, col_name, col_order, resolved_type, okf_type, is_nullable, col_desc, err_code, err_desc, timestamp
+        ])
+    except Exception as e:
+        if is_connection_closed_error(e):
+            raise
+        print(f"Error writing schema record for {db_name}.{tbl_name}.{col_name}: {e}")
 
 def main():
-    os.makedirs(TABLES_DIR, exist_ok=True)
     conn = get_teradata_connection()
     cursor = conn.cursor()
     
     try:
-        master_rows = fetch_master_metadata(cursor)
-        index_rows = fetch_indices(cursor)
+        initialize_target_table(cursor)
         
-        if not master_rows:
-            print("No matching metadata found. Ensure your tracker tables are populated and wildcards match.")
+        columns = fetch_source_columns(cursor)
+        if not columns:
+            print("No matching tables or columns found.")
             return
-            
-        # Group Data
-        tables = defaultdict(lambda: {'info': {}, 'columns': [], 'indices': []})
         
-        for r in master_rows:
-            db, tbl, col, tkind, tdesc, cdesc, cnull, size, rows, td_type, okf, is_part, order = r
-            key = (db, tbl)
-            if not tables[key]['info']:
-                tables[key]['info'] = {'db': db, 'table': tbl, 'type': tkind, 'desc': tdesc, 'size': size, 'rows': rows}
-            tables[key]['columns'].append({'name': col, 'td_type': td_type, 'okf_type': okf, 'nullable': cnull, 'desc': cdesc, 'is_partition': is_part, 'order': order})
-            
-        for db, tbl, itype, uniq, col in index_rows:
-            tables[(db, tbl)]['indices'].append((itype, uniq, col))
-            
-        print(f"Generating OKF files for {len(tables)} tables...")
+        print(f"Discovered {len(columns)} columns. Initiating metadata extraction...")
+        cleared_tables = set()
         
-        for (db, tbl), data in tables.items():
-            ddl_text = fetch_table_ddl(cursor, db, tbl, data['info']['type'])
-            md_content = generate_okf_markdown(data['info'], data['columns'], data['indices'], ddl_text)
+        for col in columns:
+            db_name, tbl_name, col_name, col_order, col_desc, nullable_flag = col
+            table_key = (db_name.upper(), tbl_name.upper())
             
-            db_dir = os.path.join(TABLES_DIR, db.replace(" ", "_").replace('"', ''))
-            os.makedirs(db_dir, exist_ok=True)
-            
-            safe_filename = f"{tbl}".replace(" ", "_").replace('"', '') + ".md"
-            filepath = os.path.join(db_dir, safe_filename)
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(md_content)
+            if table_key not in cleared_tables:
+                delete_existing_metrics(cursor, db_name, tbl_name)
+                cleared_tables.add(table_key)
+                print(f" -> Processing schema for: {db_name}.{tbl_name}")
                 
-        # Call the new indices generator
-        generate_bundle_indices(tables, OUTPUT_DIR, TABLES_DIR)
-                
-        print(f"Success! OKF bundle created in '{OUTPUT_DIR}'.")
-
+            resolved_type, err_code, err_desc = fetch_column_type(cursor, db_name, tbl_name, col_name)
+            okf_type = map_resolved_type_to_okf(resolved_type)
+            
+            # Translate Teradata 'Y'/'N' to LLM friendly True/False string literals
+            is_nullable_str = "True" if (nullable_flag or "").strip().upper() == 'Y' else "False"
+            
+            insert_column_record(
+                cursor, db_name, tbl_name, col_name, col_order, 
+                resolved_type, okf_type, is_nullable_str, col_desc, err_code, err_desc
+            )
+            
+        conn.commit()
+        print("\nAll database schema maps updated successfully!")
+        
+    except Exception as e:
+        print(f"An unexpected execution error occurred: {e}")
+        try:
+            conn.rollback()
+        except Exception as rollback_error:
+            if is_connection_closed_error(rollback_error):
+                print("Rollback skipped: Teradata connection is already closed.")
+            else:
+                print(f"Rollback failed: {rollback_error}")
     finally:
-        cursor.close()
-        conn.close()
+        try:
+            cursor.close()
+        except Exception as cursor_close_error:
+            if not is_connection_closed_error(cursor_close_error):
+                print(f"Warning: Could not close cursor cleanly: {cursor_close_error}")
+        try:
+            conn.close()
+        except Exception as conn_close_error:
+            if not is_connection_closed_error(conn_close_error):
+                print(f"Warning: Could not close connection cleanly: {conn_close_error}")
 
 if __name__ == "__main__":
     main()
