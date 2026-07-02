@@ -63,8 +63,8 @@ Required keys:
 - `TERADATA_LOGMECH`: Login mechanism, for example `TD2` or `BROWSER`.
 - `TERADATA_USER`: Username (not required for `BROWSER` SSO).
 - `TERADATA_PASSWORD`: Password (not required for `BROWSER` SSO).
-- `SOURCE_DATABASE_PATTERN`: Source database filter, for example `DWP01%_ACC_ORR%`.
-- `SOURCE_TABLE_PATTERN`: Source table filter, for example `%`.
+- `SOURCE_DATABASE_PATTERN`: Source database filter. Supports single or comma-delimited patterns, for example `DWP01%_ACC_ORR%` or `DWP01%ACC_ORR,DWP01%IDW`.
+- `SOURCE_TABLE_PATTERN`: Source table filter. Supports single or comma-delimited patterns, for example `%` or `DW_%,BM_%`.
 - `DATABASE_METADATA`: Target metadata database where helper tables are stored.
 - `TABLE_ROW_COUNT`: Target table name for row-count and size metrics.
 - `TABLE_COLUMN_TYPE`: Target table name for column type metadata.
@@ -135,12 +135,32 @@ Supported CLI override flags:
 - `--TABLE_COLUMN_TYPE`
 - `--OKF_DIRECTORY`
 
+Pattern matching notes:
+
+- Comma-delimited values are supported for both `SOURCE_DATABASE_PATTERN` and `SOURCE_TABLE_PATTERN`.
+- Multi-pattern filters are translated to SQL `LIKE ANY (...)` conditions.
+- Spaces around commas are ignored.
+
+Example `.env` values:
+
+```dotenv
+SOURCE_DATABASE_PATTERN=DWP01%ACC_ORR,DWP01%IDW
+SOURCE_TABLE_PATTERN=DW_%,BM_%
+```
+
 What it does:
 
 - Reads source metadata plus the two helper tables.
 - Produces Markdown files in `OKF_DIRECTORY` (default `okf_bundle/`).
 - Generates index files including `OKF_DIRECTORY/index.md`.
 - Builds a master index with quick database links and per-database summary counts.
+- Adds `Indexes` and `Statistics` sections to each table file between `Schema` and `Teradata DDL`.
+
+Indexes and Statistics section sources:
+
+- `Indexes` is sourced from `DBC.IndicesV`, grouped by `IndexNumber` with ordered `ColumnPosition`.
+- `Statistics` is sourced from `DBC.StatsTbl`, grouped by `StatsId` with ordered `ColumnPosition`.
+- If no rows are returned for a section, the generator writes an empty-state message (`No indexes defined.` or `No statistics collected.`).
 
 ## Output
 
