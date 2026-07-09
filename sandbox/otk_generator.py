@@ -701,42 +701,27 @@ def strip_compress_clauses(sql_text):
     return "".join(out)
 
 
-def build_logical_ddl(ddl, primary_index_comment, partitioning_comment):
-    if not normalize_text(ddl):
-        return ""
+def build_logical_ddl_from_columns(db_name, tbl_name, columns, primary_index_comment, partitioning_comment):
+    lines = [f"CREATE TABLE {db_name}.{tbl_name} ("]
+    for idx, col in enumerate(columns):
+        col_name = col['name']
+        td_type = normalize_text(col['td_type'], 'UNKNOWN')
+        nullable = normalize_text(col['nullable']).upper() == 'Y'
 
-    logical = ddl.replace("\r", "\n")
-    logical = strip_compress_clauses(logical)
-    logical = re.sub(r"\bCOMPRESS\b", "", logical, flags=re.IGNORECASE)
-    logical = re.sub(r"\s+CHARACTER\s+SET\s+(?:LATIN|UNICODE)", "", logical, flags=re.IGNORECASE)
-    logical = re.sub(r"\s+(?:NOT\s+)?CASESPECIFIC\b", "", logical, flags=re.IGNORECASE)
+        clean_type = re.sub(r"\s+CHARACTER\s+SET\s+(?:LATIN|UNICODE)", "", td_type, flags=re.IGNORECASE)
+        clean_type = re.sub(r"\s+(?:NOT\s+)?CASESPECIFIC\b", "", clean_type, flags=re.IGNORECASE)
+        clean_type = re.sub(r"\s+", " ", clean_type).strip()
 
-    logical = re.sub(
-        r"CREATE\s+(?:MULTISET\s+|SET\s+)?TABLE\s+([^\s,]+)\s*,.*?\(",
-        r"CREATE TABLE \1 (",
-        logical,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
+        nullability = "" if nullable else " NOT NULL"
+        comma = "," if idx < len(columns) - 1 else ""
+        lines.append(f" {col_name} {clean_type}{nullability}{comma}")
 
-    logical = re.split(
-        r"\n\s*(?:UNIQUE\s+)?PRIMARY\s+INDEX\b|\n\s*NO\s+PRIMARY\s+INDEX\b|\n\s*PARTITION\s+BY\b",
-        logical,
-        maxsplit=1,
-        flags=re.IGNORECASE,
-    )[0]
-    logical = re.sub(r"\n{3,}", "\n\n", logical)
-    logical = re.sub(r"[ \t]+", " ", logical)
-    logical = logical.strip()
-    if logical.endswith(")"):
-        logical += ";"
-    elif not logical.endswith(";"):
-        logical += "\n;"
-
+    lines.append(");")
     if normalize_text(primary_index_comment):
-        logical += f"\n-- Original PI: {primary_index_comment}"
+        lines.append(f"-- Original PI: {primary_index_comment}")
     if normalize_text(partitioning_comment):
-        logical += f"\n-- Original partitioning: {partitioning_comment}"
-    return logical
+        lines.append(f"-- Original partitioning: {partitioning_comment}")
+    return "\n".join(lines)
 
 
 def render_collapsed_ddl(ddl):
@@ -931,7 +916,7 @@ timestamp: {current_time}
     partitioning_comment = normalize_text(partitioning[0]['constraint_text']) if partitioning and normalize_text(partitioning[0].get('constraint_text')) else part_str
 
     md += "\n## Logical DDL\n\n```sql\n"
-    md += build_logical_ddl(ddl, primary_index_comment, partitioning_comment).strip() + "\n```\n"
+    md += build_logical_ddl_from_columns(db_name, tbl_name, columns, primary_index_comment, partitioning_comment).strip() + "\n```\n"
 
     if ddl:
         md += "\n## Teradata DDL\n\n"
