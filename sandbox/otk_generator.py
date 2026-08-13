@@ -188,7 +188,7 @@ def print_effective_config():
 def get_teradata_connection():
     try:
         logging.info(f"Connecting to Teradata host '{TD_HOST}'...")
-        is_browser_auth = normalize_text(TD_LOGMECH, "").upper() in ["BROWSER", "BROWER"]
+        is_browser_auth = normalize_text(TD_LOGMECH, "").upper() in ["BROWSER"]
         if is_browser_auth:
             return teradatasql.connect(host=TD_HOST, logmech=TD_LOGMECH)        
         else:
@@ -523,30 +523,33 @@ def fetch_historical_growth(cursor, db_name, tbl_name):
     Returns the raw query and the fetched data row.
     """
     query = """WITH WeeklySpace AS (
-/* 
+/*
    Extract Weekly Peak Table Size (in KB) over 90 Days
    Purpose: Provides a time-series view of table growth, bucketed by the Week-Ending Saturday date.
 */
-SELECT 
+SELECT
     DatabaseName,
     Tablename,
-    
-    -- Dynamically calculate the Week-Ending Saturday for any given LogDate
     LogDate AS Week_Ending_Saturday,
     (TD_SATURDAY(CURRENT_DATE)-LogDate)/7 AS WeeksAgo,
-    -- Use MAX to find the peak size during that specific week
-    CAST(MAX(CURRENTPERM) / 1024.0 AS DECIMAL(18,2)) AS Week_Size_KB,
-	AVG(Week_Size_KB) OVER (PARTITION BY Databasename,tablename) AS Average_Size_KB,
-	First_Value(Week_Size_KB) OVER (PARTITION BY Databasename,tablename ORDER BY WeeksAgo) AS First_Size_KB,
-	First_Value(Week_Size_KB) OVER (PARTITION BY Databasename,tablename ORDER BY WeeksAgo DESC) AS Last_Size_KB,
-	First_Size_KB-Last_Size_KB AS Size_Diff_KB
-
+    CAST(MAX(CURRENTPERM) / 1024.0 AS DECIMAL(18,2)) AS Week_Size_KB
 FROM pdcrinfo.TableSpace_Hst
-WHERE DatabaseName = ? AND Tablename= ?
-  AND LogDate >= TD_SATURDAY(CURRENT_DATE - 90) AND LogDate=TD_SATURDAY(Logdate) AND LOGDATE <=TD_SATURDAY(CURRENT_DATE)
-GROUP BY 1, 2, 3 , 4
+WHERE DatabaseName = ? AND Tablename = ?
+  AND LogDate >= TD_SATURDAY(CURRENT_DATE - 90) AND LogDate = TD_SATURDAY(Logdate) AND LOGDATE <= TD_SATURDAY(CURRENT_DATE)
+GROUP BY 1, 2, 3, 4
+),
+WindowStats AS (
+SELECT
+    DatabaseName,
+    Tablename,
+    WeeksAgo,
+    Week_Size_KB,
+    AVG(Week_Size_KB) OVER (PARTITION BY DatabaseName, Tablename) AS Average_Size_KB,
+    FIRST_VALUE(Week_Size_KB) OVER (PARTITION BY DatabaseName, Tablename ORDER BY WeeksAgo) AS First_Size_KB,
+    FIRST_VALUE(Week_Size_KB) OVER (PARTITION BY DatabaseName, Tablename ORDER BY WeeksAgo DESC) AS Last_Size_KB
+FROM WeeklySpace
 )
-SELECT 
+SELECT
     CAST(MAX(CASE WHEN WeeksAgo = 0 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_0_Current_KB,
     CAST(MAX(CASE WHEN WeeksAgo = 1 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_1_Ago_KB,
     CAST(MAX(CASE WHEN WeeksAgo = 2 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_2_Ago_KB,
@@ -561,10 +564,10 @@ SELECT
     CAST(MAX(CASE WHEN WeeksAgo = 11 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_11_Ago_KB,
     CAST(MAX(CASE WHEN WeeksAgo = 12 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_12_Ago_KB,
     MAX(Average_Size_KB) AS Average_Size_KB,
-	MAX(First_Size_KB) AS First_Size_KB,
-	MAX(Last_Size_KB) AS Last_Size_KB,
-	MAX(Size_Diff_KB) AS Size_Diff_KB
-FROM WeeklySpace;"""
+    MAX(First_Size_KB) AS First_Size_KB,
+    MAX(Last_Size_KB) AS Last_Size_KB,
+    CAST(MAX(First_Size_KB) - MAX(Last_Size_KB) AS DECIMAL(18,2)) AS Size_Diff_KB
+FROM WindowStats;"""
     try:
         cursor.execute(query, [db_name, tbl_name])
         # Fetch column names from cursor description
@@ -645,7 +648,12 @@ def render_partitioning_section(partitioning):
     first = partitioning[0]
     levels = normalize_text(first.get('partitioning_levels'), '0')
     col_level = first.get('column_partitioning_level')
-    col_partitioned = "Yes" if col_level not in [None, ""] and float(col_level) > 0 else "No"
+    col_partitioned = "No"
+    if col_level not in [None, ""]:
+        try:
+            col_partitioned = "Yes" if float(col_level) > 0 else "No"
+        except (ValueError, TypeError):
+            col_partitioned = "No"
     constraint_text = normalize_text(first.get('constraint_text'))
 
     md = f"**Partitioning Levels:** `{levels}`\n"
@@ -755,7 +763,7 @@ def render_storage_usage_section(storage):
     return md
 
 
-def render_historical_growth_section(growth_data, source_query):
+def render_historical_growth_section(growth_data, source_query, db_name, tbl_name):
     """Renders the historical growth trend table and the source query."""
     if not growth_data:
         md = "No historical size data available in `pdcrinfo.TableSpace_Hst` for this object.\n"
@@ -784,7 +792,8 @@ def render_historical_growth_section(growth_data, source_query):
         )
 
     md += "\n<details><summary>Source Query</summary>\n\n```sql\n"
-    md += source_query.replace("= ?", "IN ('DWP01T_IDW' AND Tablename='ITEM'").replace("AND Tablename= ?", "") + "\n```\n</details>\n"
+    safe_query = source_query.replace("= ?", f"= '{db_name}'", 1).replace("= ?", f"= '{tbl_name}'", 1)
+    md += safe_query + "\n```\n</details>\n"
     return md
 
 
@@ -968,7 +977,7 @@ def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_
     # Handle YAML safe description for frontmatter (omit entirely if empty)
     yaml_desc_line = ""
     if info['desc']:
-        safe_desc = info['desc'].replace('"', '\\"')
+        safe_desc = info['desc'].replace('"', '\\"').replace('\n', '\\n').replace('\r', '')
         yaml_desc_line = f'description: "{safe_desc}"\n'
 
     # Handle Human Readable description for markdown body
@@ -1033,7 +1042,7 @@ timestamp: {current_time}
     md += render_storage_usage_section(storage)
 
     md += "\n## Historical Growth\n\n"
-    md += render_historical_growth_section(growth['data'], growth['query'])
+    md += render_historical_growth_section(growth['data'], growth['query'], db_name, tbl_name)
 
     md += "\n## Ownership\n\n"
     md += "Not yet defined.\n"
@@ -1215,10 +1224,6 @@ Object Summary: **{len(db_map[db])}** objects total.
                 db_md += f"| [{tbl}]({safe_tbl}.md) | `{obj_type}` | {clean_desc} |\n"
 
             db_md += "\n"
-
-        for tbl, tkind, desc in sorted(db_map[db]):
-            safe_tbl = tbl.replace(" ", "_").replace('"', '')
-            _ = safe_tbl
 
         db_index_path = os.path.join(db_dir, "index.md")
         with open(db_index_path, 'w', encoding='utf-8') as f:
