@@ -155,7 +155,7 @@ def get_exact_row_count(cursor, db_name, tbl_name):
         return result[0] if result else 0
     except Exception as e:
         print(f"Warning: Could not count rows for {db_name}.{tbl_name} (skipping row count): {e}")
-        return -1
+        return None
 
 def delete_existing_metric(cursor, db_name, tbl_name):
     """
@@ -213,7 +213,7 @@ def main():
             
             # Record the new snapshot
             insert_metric_record(cursor, db_name, tbl_name, tbl_type, size_bytes, row_count)
-            print(f" -> Size: {size_bytes} Bytes | Rows: {row_count if row_count != -1 else 'N/A'} [Cleared & Saved]")
+            print(f" -> Size: {size_bytes} Bytes | Rows: {row_count if row_count is not None else 'N/A'} [Cleared & Saved]")
         # Commit transactions
         conn.commit()
         print("\nAll database metrics successfully updated and synchronized!")

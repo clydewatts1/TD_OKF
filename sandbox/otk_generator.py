@@ -1,11 +1,15 @@
 import os
 import sys
 import argparse
+import logging
 from datetime import datetime, timezone
 from collections import defaultdict
 import re
 import teradatasql
 from dotenv import load_dotenv
+
+# Basic logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Load configuration properties from the environment file
 load_dotenv()
@@ -171,26 +175,26 @@ def apply_runtime_config(cli_args):
 
 
 def print_effective_config():
-    print("Using runtime configuration:")
-    print(f"- TERADATA_HOST: {normalize_text(TD_HOST, '<not set>')}")
-    print(f"- TERADATA_LOGMECH: {normalize_text(TD_LOGMECH, '<not set>')}")
-    print(f"- SOURCE_DATABASE_PATTERN: {normalize_text(SOURCE_DB_PATTERN, '<not set>')}")
-    print(f"- SOURCE_TABLE_PATTERN: {normalize_text(SOURCE_TABLE_PATTERN, '<not set>')}")
-    print(f"- DATABASE_METADATA: {normalize_text(TARGET_DB, '<not set>')}")
-    print(f"- TABLE_ROW_COUNT: {normalize_text(TABLE_METRICS, '<not set>')}")
-    print(f"- TABLE_COLUMN_TYPE: {normalize_text(COLUMN_METRICS, '<not set>')}")
-    print(f"- OKF_DIRECTORY: {normalize_text(OUTPUT_DIR, '<not set>')}")
+    logging.info("Using runtime configuration:")
+    logging.info(f"- TERADATA_HOST: {normalize_text(TD_HOST, '<not set>')}")
+    logging.info(f"- TERADATA_LOGMECH: {normalize_text(TD_LOGMECH, '<not set>')}")
+    logging.info(f"- SOURCE_DATABASE_PATTERN: {normalize_text(SOURCE_DB_PATTERN, '<not set>')}")
+    logging.info(f"- SOURCE_TABLE_PATTERN: {normalize_text(SOURCE_TABLE_PATTERN, '<not set>')}")
+    logging.info(f"- DATABASE_METADATA: {normalize_text(TARGET_DB, '<not set>')}")
+    logging.info(f"- TABLE_ROW_COUNT: {normalize_text(TABLE_METRICS, '<not set>')}")
+    logging.info(f"- TABLE_COLUMN_TYPE: {normalize_text(COLUMN_METRICS, '<not set>')}")
+    logging.info(f"- OKF_DIRECTORY: {normalize_text(OUTPUT_DIR, '<not set>')}")
 
 def get_teradata_connection():
     try:
-        print(f"Connecting to Teradata host '{TD_HOST}'...")
+        logging.info(f"Connecting to Teradata host '{TD_HOST}'...")
         is_browser_auth = normalize_text(TD_LOGMECH, "").upper() in ["BROWSER", "BROWER"]
         if is_browser_auth:
             return teradatasql.connect(host=TD_HOST, logmech=TD_LOGMECH)        
         else:
             return teradatasql.connect(host=TD_HOST, user=TD_USER, password=TD_PASSWORD, logmech=TD_LOGMECH)
     except Exception as e:
-        print(f"Connection failed: {e}")
+        logging.error(f"Connection failed: {e}")
         sys.exit(1)
 
 def fetch_master_metadata(cursor):
@@ -198,7 +202,7 @@ def fetch_master_metadata(cursor):
     Executes the mega-join query to pull all table and column metadata, 
     including metrics and OKF data types from our sandbox tables.
     """
-    print("Extracting master schema, descriptions, and metrics...")
+    logging.info("Extracting master schema, descriptions, and metrics...")
     db_filter, db_params = build_like_filter("T.DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("T.TableName", SOURCE_TABLE_PATTERN)
 
@@ -209,8 +213,9 @@ def fetch_master_metadata(cursor):
         C.CommentString AS ColumnDescription,
         C.ColumnTitle,
         C.DefaultValue,
-        C.Nullable, COALESCE(SZ.TableSizeBytes, 0) AS TableSizeBytes,
-        COALESCE(SZ.RowCount, 0) AS RowCount, TP.TeradataDataType,
+        SZ.ExtractionTimestamp,
+        C.Nullable, SZ.TableSizeBytes AS MetricsTableSizeBytes,
+        SZ.RowCount AS MetricsRowCount, TP.TeradataDataType,
         TP.OKFDataType,
         COALESCE(C.PartitioningColumn, 'N') AS PartitioningColumn,
         ROW_NUMBER() OVER (PARTITION BY C.DatabaseName, C.TableName ORDER BY C.ColumnId) AS ColumnOrder
@@ -227,14 +232,16 @@ def fetch_master_metadata(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} master metadata rows.")
+        return rows
     except Exception as e:
-        print(f"Error reading master metadata: {e}")
+        logging.error(f"Error reading master metadata: {e}")
         return []
 
 def fetch_indices(cursor):
     """Fetches index metadata used for table-level index rendering."""
-    print("Extracting index definitions...")
+    logging.info("Extracting index definitions...")
     db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("TableName", SOURCE_TABLE_PATTERN)
 
@@ -255,15 +262,17 @@ def fetch_indices(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} index rows.")
+        return rows
     except Exception as e:
-        print(f"Error reading indices: {e}")
+        logging.error(f"Error reading indices: {e}")
         return []
 
 
 def fetch_statistics(cursor):
     """Fetches table statistics metadata used for stats section rendering."""
-    print("Extracting statistics definitions...")
+    logging.info("Extracting statistics definitions...")
     db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("TableName", SOURCE_TABLE_PATTERN)
 
@@ -307,20 +316,24 @@ def fetch_statistics(cursor):
     """
     try:
         cursor.execute(full_query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} statistics rows.")
+        return rows
     except Exception as e:
         err_text = str(e)
         if "Column" in err_text and "not found" in err_text:
             try:
-                print("Warning: StatsV detail columns unavailable. Falling back to reduced statistics projection.")
+                logging.warning("StatsV detail columns unavailable. Falling back to reduced statistics projection.")
                 cursor.execute(reduced_query, db_params + table_params)
-                return cursor.fetchall()
+                rows = cursor.fetchall()
+                logging.info(f"Fetched {len(rows)} reduced statistics rows.")
+                return rows
             except Exception as fallback_err:
                 first_line = str(fallback_err).splitlines()[0] if str(fallback_err) else "unknown error"
-                print(f"Warning: Could not read reduced statistics metadata: {first_line}")
+                logging.warning(f"Could not read reduced statistics metadata: {first_line}")
                 return []
         first_line = err_text.splitlines()[0] if err_text else "unknown error"
-        print(f"Warning: Could not read statistics metadata: {first_line}")
+        logging.warning(f"Could not read statistics metadata: {first_line}")
         return []
 
 def fetch_table_ddl(cursor, db_name, tbl_name, table_kind):
@@ -336,15 +349,15 @@ def fetch_table_ddl(cursor, db_name, tbl_name, table_kind):
         err_text = str(e)
         # Object may disappear between discovery and SHOW; keep log concise.
         if "Error 3807" in err_text:
-            print(f"Warning: Could not fetch DDL for {db_name}.{tbl_name}: object does not exist (3807).")
+            logging.warning(f"Could not fetch DDL for {db_name}.{tbl_name}: object does not exist (3807).")
         else:
             first_line = err_text.splitlines()[0] if err_text else "unknown error"
-            print(f"Warning: Could not fetch DDL for {db_name}.{tbl_name}: {first_line}")
+            logging.warning(f"Could not fetch DDL for {db_name}.{tbl_name}: {first_line}")
         return ""
 
 
 def fetch_partitioning(cursor):
-    print("Extracting partitioning metadata...")
+    logging.info("Extracting partitioning metadata...")
     db_filter, db_params = build_like_filter("pc.DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("pc.TableName", SOURCE_TABLE_PATTERN)
 
@@ -361,15 +374,17 @@ def fetch_partitioning(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} partitioning rows.")
+        return rows
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read partitioning metadata: {first_line}")
+        logging.warning(f"Could not read partitioning metadata: {first_line}")
         return []
 
 
 def fetch_relationships_outbound(cursor):
-    print("Extracting outbound relationship metadata...")
+    logging.info("Extracting outbound relationship metadata...")
     db_filter, db_params = build_like_filter("ri.ChildDB", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("ri.ChildTable", SOURCE_TABLE_PATTERN)
 
@@ -388,15 +403,17 @@ def fetch_relationships_outbound(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} outbound relationship rows.")
+        return rows
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read outbound relationships: {first_line}")
+        logging.warning(f"Could not read outbound relationships: {first_line}")
         return []
 
 
 def fetch_relationships_inbound(cursor):
-    print("Extracting inbound relationship metadata...")
+    logging.info("Extracting inbound relationship metadata...")
     db_filter, db_params = build_like_filter("ri.ParentDB", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("ri.ParentTable", SOURCE_TABLE_PATTERN)
 
@@ -414,15 +431,17 @@ def fetch_relationships_inbound(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} inbound relationship rows.")
+        return rows
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read inbound relationships: {first_line}")
+        logging.warning(f"Could not read inbound relationships: {first_line}")
         return []
 
 
 def fetch_column_domains(cursor):
-    print("Extracting column domain metadata...")
+    logging.info("Extracting column domain metadata...")
     db_filter, db_params = build_like_filter("c.DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("c.TableName", SOURCE_TABLE_PATTERN)
 
@@ -439,15 +458,17 @@ def fetch_column_domains(cursor):
     """
     try:
         cursor.execute(query, db_params + table_params)
-        return cursor.fetchall()
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} column domain rows.")
+        return rows
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read column domains: {first_line}")
+        logging.warning(f"Could not read column domains: {first_line}")
         return []
 
 
 def fetch_storage_usage(cursor):
-    print("Extracting storage and usage metadata...")
+    logging.info("Extracting storage and usage metadata...")
     db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
     table_filter, table_params = build_like_filter("TableName", SOURCE_TABLE_PATTERN)
 
@@ -480,18 +501,82 @@ def fetch_storage_usage(cursor):
     try:
         cursor.execute(size_query, db_params + table_params)
         size_rows = cursor.fetchall()
+        logging.info(f"Fetched {len(size_rows)} table size rows.")
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read table size metrics: {first_line}")
+        logging.warning(f"Could not read table size metrics: {first_line}")
 
     try:
         cursor.execute(timestamp_query, db_params + table_params)
         ts_rows = cursor.fetchall()
+        logging.info(f"Fetched {len(ts_rows)} timestamp rows.")
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
-        print(f"Warning: Could not read table timestamp metrics: {first_line}")
+        logging.warning(f"Could not read table timestamp metrics: {first_line}")
 
     return size_rows, ts_rows
+
+
+def fetch_historical_growth(cursor, db_name, tbl_name):
+    """
+    Fetches 90-day historical table size from PDCR, pivoted by week.
+    Returns the raw query and the fetched data row.
+    """
+    query = """WITH WeeklySpace AS (
+/* 
+   Extract Weekly Peak Table Size (in KB) over 90 Days
+   Purpose: Provides a time-series view of table growth, bucketed by the Week-Ending Saturday date.
+*/
+SELECT 
+    DatabaseName,
+    Tablename,
+    
+    -- Dynamically calculate the Week-Ending Saturday for any given LogDate
+    LogDate AS Week_Ending_Saturday,
+    (TD_SATURDAY(CURRENT_DATE)-LogDate)/7 AS WeeksAgo,
+    -- Use MAX to find the peak size during that specific week
+    CAST(MAX(CURRENTPERM) / 1024.0 AS DECIMAL(18,2)) AS Week_Size_KB,
+	AVG(Week_Size_KB) OVER (PARTITION BY Databasename,tablename) AS Average_Size_KB,
+	First_Value(Week_Size_KB) OVER (PARTITION BY Databasename,tablename ORDER BY WeeksAgo) AS First_Size_KB,
+	First_Value(Week_Size_KB) OVER (PARTITION BY Databasename,tablename ORDER BY WeeksAgo DESC) AS Last_Size_KB,
+	First_Size_KB-Last_Size_KB AS Size_Diff_KB
+
+FROM pdcrinfo.TableSpace_Hst
+WHERE DatabaseName = ? AND Tablename= ?
+  AND LogDate >= TD_SATURDAY(CURRENT_DATE - 90) AND LogDate=TD_SATURDAY(Logdate) AND LOGDATE <=TD_SATURDAY(CURRENT_DATE)
+GROUP BY 1, 2, 3 , 4
+)
+SELECT 
+    CAST(MAX(CASE WHEN WeeksAgo = 0 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_0_Current_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 1 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_1_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 2 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_2_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 3 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_3_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 4 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_4_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 5 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_5_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 6 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_6_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 7 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_7_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 8 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_8_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 9 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_9_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 10 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_10_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 11 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_11_Ago_KB,
+    CAST(MAX(CASE WHEN WeeksAgo = 12 THEN Week_Size_KB END) AS DECIMAL(18,2)) AS Wk_12_Ago_KB,
+    MAX(Average_Size_KB) AS Average_Size_KB,
+	MAX(First_Size_KB) AS First_Size_KB,
+	MAX(Last_Size_KB) AS Last_Size_KB,
+	MAX(Size_Diff_KB) AS Size_Diff_KB
+FROM WeeklySpace;"""
+    try:
+        cursor.execute(query, [db_name, tbl_name])
+        # Fetch column names from cursor description
+        columns = [desc[0] for desc in cursor.description]
+        row = cursor.fetchone()
+        if row:
+            return query, dict(zip(columns, row))
+        return query, None
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else "unknown error"
+        logging.warning(f"Could not read historical growth for {db_name}.{tbl_name}: {first_line}")
+        return query, None
 
 def format_column_list(columns):
     return ", ".join(f"`{col}`" for col in columns) if columns else ""
@@ -653,6 +738,7 @@ def render_storage_usage_section(storage):
     created = format_iso_utc(storage.get('create_timestamp'))
     altered = format_iso_utc(storage.get('last_alter_timestamp'))
     accessed = format_iso_utc(storage.get('last_access_timestamp')) if storage.get('last_access_timestamp') else "Not tracked"
+    metrics_extracted = format_iso_utc(storage.get('metrics_extraction_timestamp'))
 
     md = "| Metric | Value |\n"
     md += "| :--- | :--- |\n"
@@ -662,9 +748,43 @@ def render_storage_usage_section(storage):
     md += f"| Created | `{created}` |\n"
     md += f"| Last Altered | `{altered}` |\n"
     md += f"| Last Accessed | `{accessed}` |\n"
+    md += f"| Metrics Extracted | `{metrics_extracted}` |\n"
 
     if skew_num is not None and skew_num > 0.20:
         md += "\nSkew interpretation: notable skew (> 0.20). Avoid reusing PI columns as Databricks distribution keys.\n"
+    return md
+
+
+def render_historical_growth_section(growth_data, source_query):
+    """Renders the historical growth trend table and the source query."""
+    if not growth_data:
+        md = "No historical size data available in `pdcrinfo.TableSpace_Hst` for this object.\n"
+    else:
+        md = "Weekly peak table size (KB) over the last 90 days. Week 0 is the most recent week.\n\n"
+        md += "| Metric | Value |\n"
+        md += "| :--- | :--- |\n"
+        md += f"| 90-Day Avg Size (KB) | `{format_number(growth_data.get('Average_Size_KB'))}` |\n"
+        md += f"| 90-Day Growth (KB) | `{format_number(growth_data.get('Size_Diff_KB'))}` |\n"
+        md += "\n"
+        md += "| Wk 0 | Wk 1 | Wk 2 | Wk 3 | Wk 4 | Wk 5 | Wk 6 |\n"
+        md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        md += (
+            f"| {format_number(growth_data.get('Wk_0_Current_KB'))} | {format_number(growth_data.get('Wk_1_Ago_KB'))} | "
+            f"{format_number(growth_data.get('Wk_2_Ago_KB'))} | {format_number(growth_data.get('Wk_3_Ago_KB'))} | "
+            f"{format_number(growth_data.get('Wk_4_Ago_KB'))} | {format_number(growth_data.get('Wk_5_Ago_KB'))} | "
+            f"{format_number(growth_data.get('Wk_6_Ago_KB'))} |\n"
+        )
+        md += "\n"
+        md += "| Wk 7 | Wk 8 | Wk 9 | Wk 10 | Wk 11 | Wk 12 |\n"
+        md += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        md += (
+            f"| {format_number(growth_data.get('Wk_7_Ago_KB'))} | {format_number(growth_data.get('Wk_8_Ago_KB'))} | "
+            f"{format_number(growth_data.get('Wk_9_Ago_KB'))} | {format_number(growth_data.get('Wk_10_Ago_KB'))} | "
+            f"{format_number(growth_data.get('Wk_11_Ago_KB'))} | {format_number(growth_data.get('Wk_12_Ago_KB'))} |\n"
+        )
+
+    md += "\n<details><summary>Source Query</summary>\n\n```sql\n"
+    md += source_query.replace("= ?", "IN ('DWP01T_IDW' AND Tablename='ITEM'").replace("AND Tablename= ?", "") + "\n```\n</details>\n"
     return md
 
 
@@ -819,8 +939,8 @@ def render_statistics_section(stat_rows):
     return md
 
 
-def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, ddl):
-    """Constructs the OKF v0.1 compliant Markdown file string."""
+def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, growth, ddl):
+    """Constructs the OKF v0.2 compliant Markdown file string."""
     
     db_name, tbl_name = info['db'], info['table']
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -828,8 +948,8 @@ def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_
     clean_type = info['type'].strip().upper()
     
     # Map Table Kind
-    type_map = {'T': 'Standard Table', 'O': 'Queue Table', 'V': 'View'}
-    obj_type = type_map.get(clean_type, 'Unknown')
+    type_map = {'T': 'table', 'O': 'queue_table', 'V': 'view'}
+    obj_type = type_map.get(clean_type, 'unknown')
 
     # Parse Indexes into printable strings
     pk_cols = [item['column_name'] for item in indices if normalize_text(item['index_type']).upper() == 'K' and normalize_text(item['column_name'])]
@@ -842,8 +962,8 @@ def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_
     pi_str = f"{pi_type} on `{', '.join(pi_cols)}`" if pi_cols else pi_type
     part_str = f"`{', '.join(part_cols)}`" if part_cols else "None"
 
-    rows_str = "Unknown" if clean_type == 'V' else f"{info['rows']:,}"
-    size_str = "Unknown" if clean_type == 'V' else f"{info['size']:,}"
+    rows_str = "N/A" if clean_type == 'V' else (f"{info['rows']:,}" if info.get('rows') is not None else "Unknown")
+    size_str = "N/A" if clean_type == 'V' else (f"{info['size']:,} bytes" if info.get('size') is not None else "Unknown")
 
     # Handle YAML safe description for frontmatter (omit entirely if empty)
     yaml_desc_line = ""
@@ -856,10 +976,10 @@ def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_
 
     # Build Frontmatter
     md = f"""---
-type: Teradata Table
+type: teradata {obj_type}
 title: "{db_name}.{tbl_name}"
 {yaml_desc_line}tags:
-  - {db_name}
+  - {db_name.lower()}
   - teradata
   - {obj_type.lower().replace(' ', '_')}
 timestamp: {current_time}
@@ -871,13 +991,13 @@ timestamp: {current_time}
 **Object Type:** `{obj_type} ({clean_type})`  
 **Description:** {tbl_desc}  
 **Rows:** `{rows_str}`  
-**Size (Bytes):** `{size_str}`  
+**Size:** `{size_str}`  
 
 **Primary Key:** {pk_str}  
 **Primary Index:** {pi_str}  
 **Partition Columns:** {part_str}
 
-## Schema
+## Columns
 
 | Column Name | Teradata Type | OKF Type | Nullable | Description | Title | Default | Order |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -912,21 +1032,32 @@ timestamp: {current_time}
     md += "\n## Storage & Usage\n\n"
     md += render_storage_usage_section(storage)
 
+    md += "\n## Historical Growth\n\n"
+    md += render_historical_growth_section(growth['data'], growth['query'])
+
+    md += "\n## Ownership\n\n"
+    md += "Not yet defined.\n"
+
+    md += "\n## Lineage\n\n"
+    md += "Not yet defined.\n"
+
     primary_index_comment = pi_str
     partitioning_comment = normalize_text(partitioning[0]['constraint_text']) if partitioning and normalize_text(partitioning[0].get('constraint_text')) else part_str
 
-    md += "\n## Logical DDL\n\n```sql\n"
+    md += "\n## DDL\n\n"
+    md += "### Logical DDL\n\n"
+    md += "```sql\n"
     md += build_logical_ddl_from_columns(db_name, tbl_name, columns, primary_index_comment, partitioning_comment).strip() + "\n```\n"
 
     if ddl:
-        md += "\n## Teradata DDL\n\n"
+        md += "\n### Raw DDL\n\n"
         md += render_collapsed_ddl(ddl)
 
     return md
 
 def generate_bundle_indices(tables, output_dir, tables_dir):
     """Generates the root index.md and individual database index.md files."""
-    print("Generating OKF index files...")
+    logging.info("Generating OKF index files...")
     current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     
     # Group tables by database for the index
@@ -1113,7 +1244,7 @@ def main():
         size_rows, timestamp_rows = fetch_storage_usage(cursor)
         
         if not master_rows:
-            print("No matching metadata found. Ensure your tracker tables are populated and wildcards match.")
+            logging.warning("No matching metadata found. Ensure your tracker tables are populated and wildcards match.")
             return
             
         # Group Data
@@ -1127,13 +1258,20 @@ def main():
             'relationships_inbound': [],
             'domains': [],
             'storage': {},
+            'growth': {},
         })
         
         for r in master_rows:
-            db, tbl, col, tkind, tdesc, cdesc, ctitle, cdefault, cnull, size, rows, td_type, okf, is_part, order = r
+            db, tbl, col, tkind, tdesc, cdesc, ctitle, cdefault, metrics_ts, cnull, metrics_size, metrics_rows, td_type, okf, is_part, order = r
             key = (db, tbl)
             if not tables[key]['info']:
-                tables[key]['info'] = {'db': db, 'table': tbl, 'type': tkind, 'desc': tdesc, 'size': size, 'rows': rows}
+                tables[key]['info'] = {
+                    'db': db, 'table': tbl, 'type': tkind, 'desc': tdesc, 
+                    'size': metrics_size, 
+                    'rows': metrics_rows, 
+                    'metrics_ts': metrics_ts
+                }
+
             tables[key]['columns'].append({
                 'name': col,
                 'td_type': td_type,
@@ -1235,6 +1373,7 @@ def main():
                 tables[key]['storage'].update({
                     'create_timestamp': create_ts,
                     'last_alter_timestamp': alter_ts,
+                    'metrics_extraction_timestamp': tables[key]['info'].get('metrics_ts'),
                     'last_access_timestamp': access_ts,
                 })
 
@@ -1244,21 +1383,22 @@ def main():
         }
 
         if unmatched_index_tables:
-            print(
-                f"Warning: Skipping index metadata for {len(unmatched_index_tables)} table(s) "
+            logging.warning(
+                f"Skipping index metadata for {len(unmatched_index_tables)} table(s) "
                 "that were not present in master metadata."
             )
 
         if unmatched_stats_tables:
-            print(
-                f"Warning: Skipping statistics metadata for {len(unmatched_stats_tables)} table(s) "
+            logging.warning(
+                f"Skipping statistics metadata for {len(unmatched_stats_tables)} table(s) "
                 "that were not present in master metadata."
             )
 
-        print(f"Generating OKF files for {len(valid_tables)} tables...")
+        logging.info(f"Generating OKF files for {len(valid_tables)} tables...")
         
         for (db, tbl), data in valid_tables.items():
             ddl_content = fetch_table_ddl(cursor, db, tbl, data['info']['type'])
+            growth_query, growth_data = fetch_historical_growth(cursor, db, tbl)
             md_content = generate_okf_markdown(
                 data['info'],
                 data['columns'],
@@ -1269,6 +1409,7 @@ def main():
                 data['relationships_inbound'],
                 data['domains'],
                 data['storage'],
+                {'query': growth_query, 'data': growth_data},
                 ddl_content,
             )
             
@@ -1278,13 +1419,14 @@ def main():
             safe_filename = f"{tbl}".replace(" ", "_").replace('"', '') + ".md"
             filepath = os.path.join(db_dir, safe_filename)
             
+            logging.info(f"Writing OKF file to {filepath}")
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(md_content)
                 
         # Call the new indices generator
         generate_bundle_indices(valid_tables, OUTPUT_DIR, TABLES_DIR)
                 
-        print(f"Success! OKF bundle created in '{OUTPUT_DIR}'.")
+        logging.info(f"Success! OKF bundle created in '{OUTPUT_DIR}'.")
 
     finally:
         cursor.close()
