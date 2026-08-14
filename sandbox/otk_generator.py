@@ -23,6 +23,7 @@ SOURCE_TABLE_PATTERN = os.getenv("SOURCE_TABLE_PATTERN", "%")
 TARGET_DB = os.getenv("DATABASE_METADATA", "DWB02T_SANDBOX")
 TABLE_METRICS = os.getenv("TABLE_ROW_COUNT", "table_size_metrics")
 COLUMN_METRICS =  os.getenv("TABLE_COLUMN_TYPE", "table_column_types")
+TABLE_SCD_COUNT = os.getenv("TABLE_SCD_COUNT", "scd_frequency_metrics")
 OKF_DIRECTORY = os.getenv("OKF_DIRECTORY", "okf_bundle")
 
 CONFIG_DEFAULTS = {
@@ -32,6 +33,7 @@ CONFIG_DEFAULTS = {
     "DATABASE_METADATA": "DWB02T_SANDBOX",
     "TABLE_ROW_COUNT": "table_size_metrics",
     "TABLE_COLUMN_TYPE": "table_column_types",
+    "TABLE_SCD_COUNT": "scd_frequency_metrics",
     "OKF_DIRECTORY": "okf_bundle",
 }
 
@@ -45,6 +47,7 @@ CONFIG_KEYS = [
     "DATABASE_METADATA",
     "TABLE_ROW_COUNT",
     "TABLE_COLUMN_TYPE",
+    "TABLE_SCD_COUNT",
     "OKF_DIRECTORY",
 ]
 
@@ -155,6 +158,7 @@ def apply_runtime_config(cli_args):
     global TARGET_DB
     global TABLE_METRICS
     global COLUMN_METRICS
+    global TABLE_SCD_COUNT
     global OKF_DIRECTORY
     global OUTPUT_DIR
     global TABLES_DIR
@@ -168,6 +172,7 @@ def apply_runtime_config(cli_args):
     TARGET_DB = resolve_setting(cli_args, "DATABASE_METADATA")
     TABLE_METRICS = resolve_setting(cli_args, "TABLE_ROW_COUNT")
     COLUMN_METRICS = resolve_setting(cli_args, "TABLE_COLUMN_TYPE")
+    TABLE_SCD_COUNT = resolve_setting(cli_args, "TABLE_SCD_COUNT")
     OKF_DIRECTORY = resolve_setting(cli_args, "OKF_DIRECTORY")
 
     OUTPUT_DIR = OKF_DIRECTORY
@@ -183,6 +188,7 @@ def print_effective_config():
     logging.info(f"- DATABASE_METADATA: {normalize_text(TARGET_DB, '<not set>')}")
     logging.info(f"- TABLE_ROW_COUNT: {normalize_text(TABLE_METRICS, '<not set>')}")
     logging.info(f"- TABLE_COLUMN_TYPE: {normalize_text(COLUMN_METRICS, '<not set>')}")
+    logging.info(f"- TABLE_SCD_COUNT: {normalize_text(TABLE_SCD_COUNT, '<not set>')}")
     logging.info(f"- OKF_DIRECTORY: {normalize_text(OUTPUT_DIR, '<not set>')}")
 
 def get_teradata_connection():
@@ -355,6 +361,34 @@ def fetch_table_ddl(cursor, db_name, tbl_name, table_kind):
             logging.warning(f"Could not fetch DDL for {db_name}.{tbl_name}: {first_line}")
         return ""
 
+
+def fetch_scd_metadata(cursor):
+    """Fetches SCD frequency metadata for all tables with tracked SCD columns."""
+    logging.info("Extracting SCD frequency metadata...")
+    db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
+    table_filter, table_params = build_like_filter("TableName", SOURCE_TABLE_PATTERN)
+
+    query = f"""
+    SELECT
+        DatabaseName,
+        TableName,
+        ColumnName,
+        SCD_ColumnValue,
+        RowCount,
+        ExtractionTimestamp
+    FROM "{TARGET_DB}"."{TABLE_SCD_COUNT}"
+    WHERE {db_filter} AND {table_filter}
+    ORDER BY DatabaseName, TableName, ColumnName, SCD_ColumnValue DESC
+    """
+    try:
+        cursor.execute(query, db_params + table_params)
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} SCD metadata rows.")
+        return rows
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else "unknown error"
+        logging.warning(f"Could not read SCD metadata: {first_line}")
+        return []
 
 def fetch_partitioning(cursor):
     logging.info("Extracting partitioning metadata...")
@@ -797,6 +831,32 @@ def render_historical_growth_section(growth_data, source_query, db_name, tbl_nam
     return md
 
 
+def render_scd_metadata_section(scd_rows):
+    """Renders SCD frequency metadata for migration analysis."""
+    if not scd_rows:
+        return "No SCD metadata available for this table.\n"
+
+    md = "SCD columns track slowly changing dimension changes. These timestamps and counts help assess change frequency for migration planning.\n\n"
+    md += "| Column Name | Effective Date | Row Count | % of Total |\n"
+    md += "| :--- | :--- | ---: | ---: |\n"
+
+    total_rows = sum(row['row_count'] if row['row_count'] else 0 for row in scd_rows)
+
+    for row in scd_rows:
+        col_name = normalize_text(row['column_name'])
+        col_value = format_iso_utc(row['scd_column_value']) if row['scd_column_value'] else "Unknown"
+        row_count = format_number(row['row_count']) if row['row_count'] else "0"
+        pct = ""
+        if total_rows and row['row_count']:
+            try:
+                pct = f"{(float(row['row_count']) / float(total_rows) * 100):.2f}%"
+            except (ValueError, TypeError):
+                pct = "N/A"
+
+        md += f"| `{col_name}` | `{col_value}` | {row_count} | {pct} |\n"
+
+    return md
+
 def strip_compress_clauses(sql_text):
     upper_text = sql_text.upper()
     out = []
@@ -948,7 +1008,7 @@ def render_statistics_section(stat_rows):
     return md
 
 
-def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, growth, ddl):
+def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, growth, scd_metadata, ddl):
     """Constructs the OKF v0.2 compliant Markdown file string."""
     
     db_name, tbl_name = info['db'], info['table']
@@ -1043,6 +1103,9 @@ timestamp: {current_time}
 
     md += "\n## Historical Growth\n\n"
     md += render_historical_growth_section(growth['data'], growth['query'], db_name, tbl_name)
+
+    md += "\n## SCD Frequency (Change Tracking)\n\n"
+    md += render_scd_metadata_section(scd_metadata)
 
     md += "\n## Ownership\n\n"
     md += "Not yet defined.\n"
@@ -1247,6 +1310,7 @@ def main():
         inbound_rel_rows = fetch_relationships_inbound(cursor)
         domain_rows = fetch_column_domains(cursor)
         size_rows, timestamp_rows = fetch_storage_usage(cursor)
+        scd_rows = fetch_scd_metadata(cursor)
         
         if not master_rows:
             logging.warning("No matching metadata found. Ensure your tracker tables are populated and wildcards match.")
@@ -1264,6 +1328,7 @@ def main():
             'domains': [],
             'storage': {},
             'growth': {},
+            'scd_metadata': [],
         })
         
         for r in master_rows:
@@ -1362,6 +1427,16 @@ def main():
                     'compress_value_list': compress_values,
                 })
 
+        for db, tbl, col_name, col_value, row_count, extract_ts in scd_rows:
+            key = (db, tbl)
+            if key in tables and tables[key]['info']:
+                tables[key]['scd_metadata'].append({
+                    'column_name': col_name,
+                    'scd_column_value': col_value,
+                    'row_count': row_count,
+                    'extraction_timestamp': extract_ts,
+                })
+
         for db, tbl, amp_count, total_perm, max_amp, avg_amp in size_rows:
             key = (db, tbl)
             if key in tables and tables[key]['info']:
@@ -1415,6 +1490,7 @@ def main():
                 data['domains'],
                 data['storage'],
                 {'query': growth_query, 'data': growth_data},
+                data['scd_metadata'],
                 ddl_content,
             )
             
