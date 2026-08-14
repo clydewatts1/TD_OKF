@@ -8,4 +8,5 @@ DATABASE_METADATA=<metadata_database>
 TABLE_ROW_COUNT=<table_row_count>
 TABLE_COLUMN_TYPE=<table_column_type>
 TABLE_SCD_COUNT=scd_frequency_metrics
+TABLE_LABELS=table_labels
 OKF_DIRECTORY=okf_bundle

@@ -24,6 +24,7 @@ TARGET_DB = os.getenv("DATABASE_METADATA", "DWB02T_SANDBOX")
 TABLE_METRICS = os.getenv("TABLE_ROW_COUNT", "table_size_metrics")
 COLUMN_METRICS =  os.getenv("TABLE_COLUMN_TYPE", "table_column_types")
 TABLE_SCD_COUNT = os.getenv("TABLE_SCD_COUNT", "scd_frequency_metrics")
+TABLE_LABELS = os.getenv("TABLE_LABELS", "table_labels")
 OKF_DIRECTORY = os.getenv("OKF_DIRECTORY", "okf_bundle")
 
 CONFIG_DEFAULTS = {
@@ -34,6 +35,7 @@ CONFIG_DEFAULTS = {
     "TABLE_ROW_COUNT": "table_size_metrics",
     "TABLE_COLUMN_TYPE": "table_column_types",
     "TABLE_SCD_COUNT": "scd_frequency_metrics",
+    "TABLE_LABELS": "table_labels",
     "OKF_DIRECTORY": "okf_bundle",
 }
 
@@ -48,6 +50,7 @@ CONFIG_KEYS = [
     "TABLE_ROW_COUNT",
     "TABLE_COLUMN_TYPE",
     "TABLE_SCD_COUNT",
+    "TABLE_LABELS",
     "OKF_DIRECTORY",
 ]
 
@@ -159,6 +162,7 @@ def apply_runtime_config(cli_args):
     global TABLE_METRICS
     global COLUMN_METRICS
     global TABLE_SCD_COUNT
+    global TABLE_LABELS
     global OKF_DIRECTORY
     global OUTPUT_DIR
     global TABLES_DIR
@@ -173,6 +177,7 @@ def apply_runtime_config(cli_args):
     TABLE_METRICS = resolve_setting(cli_args, "TABLE_ROW_COUNT")
     COLUMN_METRICS = resolve_setting(cli_args, "TABLE_COLUMN_TYPE")
     TABLE_SCD_COUNT = resolve_setting(cli_args, "TABLE_SCD_COUNT")
+    TABLE_LABELS = resolve_setting(cli_args, "TABLE_LABELS")
     OKF_DIRECTORY = resolve_setting(cli_args, "OKF_DIRECTORY")
 
     OUTPUT_DIR = OKF_DIRECTORY
@@ -189,6 +194,7 @@ def print_effective_config():
     logging.info(f"- TABLE_ROW_COUNT: {normalize_text(TABLE_METRICS, '<not set>')}")
     logging.info(f"- TABLE_COLUMN_TYPE: {normalize_text(COLUMN_METRICS, '<not set>')}")
     logging.info(f"- TABLE_SCD_COUNT: {normalize_text(TABLE_SCD_COUNT, '<not set>')}")
+    logging.info(f"- TABLE_LABELS: {normalize_text(TABLE_LABELS, '<not set>')}")
     logging.info(f"- OKF_DIRECTORY: {normalize_text(OUTPUT_DIR, '<not set>')}")
 
 def get_teradata_connection():
@@ -388,6 +394,34 @@ def fetch_scd_metadata(cursor):
     except Exception as e:
         first_line = str(e).splitlines()[0] if str(e) else "unknown error"
         logging.warning(f"Could not read SCD metadata: {first_line}")
+        return []
+
+def fetch_table_labels(cursor):
+    """Fetches table labels and tags for metadata classification."""
+    logging.info("Extracting table labels and tags...")
+    db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
+    table_filter, table_params = build_like_filter("TableName", SOURCE_TABLE_PATTERN)
+
+    query = f"""
+    SELECT
+        DatabaseName,
+        TableName,
+        TypeName,
+        TypeDescription,
+        TagName,
+        TagDescription
+    FROM "{TARGET_DB}"."{TABLE_LABELS}"
+    WHERE {db_filter} AND {table_filter}
+    ORDER BY DatabaseName, TableName, TypeName, TagName
+    """
+    try:
+        cursor.execute(query, db_params + table_params)
+        rows = cursor.fetchall()
+        logging.info(f"Fetched {len(rows)} table label rows.")
+        return rows
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else "unknown error"
+        logging.warning(f"Could not read table labels: {first_line}")
         return []
 
 def fetch_partitioning(cursor):
@@ -857,6 +891,36 @@ def render_scd_metadata_section(scd_rows):
 
     return md
 
+def render_table_labels_section(label_rows):
+    """Renders table labels and tags for metadata organization."""
+    if not label_rows:
+        return "No labels or tags defined for this table.\n"
+
+    md = "Table classifications and tags for metadata organization and data governance.\n\n"
+
+    grouped = defaultdict(list)
+    for row in label_rows:
+        type_name = normalize_text(row['type_name'])
+        grouped[type_name].append(row)
+
+    for type_name in sorted(grouped.keys()):
+        rows = grouped[type_name]
+        first = rows[0]
+        type_desc = normalize_text(first['type_description'])
+
+        md += f"**{type_name}** ({type_desc})\n\n"
+        md += "| Tag | Description |\n"
+        md += "| :--- | :--- |\n"
+
+        for row in rows:
+            tag_name = normalize_text(row['tag_name'], '(unlabeled)')
+            tag_desc = normalize_text(row['tag_description'], '')
+            md += f"| `{tag_name}` | {tag_desc} |\n"
+
+        md += "\n"
+
+    return md
+
 def strip_compress_clauses(sql_text):
     upper_text = sql_text.upper()
     out = []
@@ -1008,7 +1072,7 @@ def render_statistics_section(stat_rows):
     return md
 
 
-def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, growth, scd_metadata, ddl):
+def generate_okf_markdown(info, columns, indices, partitioning, statistics, rel_outbound, rel_inbound, domains, storage, growth, scd_metadata, table_labels, ddl):
     """Constructs the OKF v0.2 compliant Markdown file string."""
     
     db_name, tbl_name = info['db'], info['table']
@@ -1106,6 +1170,9 @@ timestamp: {current_time}
 
     md += "\n## SCD Frequency (Change Tracking)\n\n"
     md += render_scd_metadata_section(scd_metadata)
+
+    md += "\n## Labels & Tags\n\n"
+    md += render_table_labels_section(table_labels)
 
     md += "\n## Ownership\n\n"
     md += "Not yet defined.\n"
@@ -1311,6 +1378,7 @@ def main():
         domain_rows = fetch_column_domains(cursor)
         size_rows, timestamp_rows = fetch_storage_usage(cursor)
         scd_rows = fetch_scd_metadata(cursor)
+        label_rows = fetch_table_labels(cursor)
         
         if not master_rows:
             logging.warning("No matching metadata found. Ensure your tracker tables are populated and wildcards match.")
@@ -1329,6 +1397,7 @@ def main():
             'storage': {},
             'growth': {},
             'scd_metadata': [],
+            'table_labels': [],
         })
         
         for r in master_rows:
@@ -1437,6 +1506,16 @@ def main():
                     'extraction_timestamp': extract_ts,
                 })
 
+        for db, tbl, type_name, type_desc, tag_name, tag_desc in label_rows:
+            key = (db, tbl)
+            if key in tables and tables[key]['info']:
+                tables[key]['table_labels'].append({
+                    'type_name': type_name,
+                    'type_description': type_desc,
+                    'tag_name': tag_name,
+                    'tag_description': tag_desc,
+                })
+
         for db, tbl, amp_count, total_perm, max_amp, avg_amp in size_rows:
             key = (db, tbl)
             if key in tables and tables[key]['info']:
@@ -1491,6 +1570,7 @@ def main():
                 data['storage'],
                 {'query': growth_query, 'data': growth_data},
                 data['scd_metadata'],
+                data['table_labels'],
                 ddl_content,
             )
             
