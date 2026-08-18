@@ -224,5 +224,9 @@ okf_bundle/
 okf_bundle_acc_orr/
 okf_bundle_acc_cli_test/
 okf_bundle_databricks/
+okf_bundle_dbc_1720/
+okf_bundle_pdcrinfo_1720/
 # any zip files
 *.zip
+*.7z
+*.rar
