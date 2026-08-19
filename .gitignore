@@ -226,3 +226,5 @@ okf_bundle_acc_cli_test/
 okf_bundle_databricks/
 # any zip files
 *.zip
+# OKF
+OKF/

@@ -10,3 +10,4 @@ TABLE_COLUMN_TYPE=<table_column_type>
 TABLE_SCD_COUNT=scd_frequency_metrics
 TABLE_LABELS=table_labels
 OKF_DIRECTORY=okf_bundle
+EXCLUDE_DB_OWNER_PATTERN=%USER%

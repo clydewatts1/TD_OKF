@@ -26,6 +26,7 @@ COLUMN_METRICS =  os.getenv("TABLE_COLUMN_TYPE", "table_column_types")
 TABLE_SCD_COUNT = os.getenv("TABLE_SCD_COUNT", "scd_frequency_metrics")
 TABLE_LABELS = os.getenv("TABLE_LABELS", "table_labels")
 OKF_DIRECTORY = os.getenv("OKF_DIRECTORY", "okf_bundle")
+EXCLUDE_DB_OWNER_PATTERN = os.getenv("EXCLUDE_DB_OWNER_PATTERN", "%USER%")
 
 CONFIG_DEFAULTS = {
     "TERADATA_LOGMECH": "TD2",
@@ -37,6 +38,7 @@ CONFIG_DEFAULTS = {
     "TABLE_SCD_COUNT": "scd_frequency_metrics",
     "TABLE_LABELS": "table_labels",
     "OKF_DIRECTORY": "okf_bundle",
+    "EXCLUDE_DB_OWNER_PATTERN": "%USER%",
 }
 
 CONFIG_KEYS = [
@@ -52,6 +54,7 @@ CONFIG_KEYS = [
     "TABLE_SCD_COUNT",
     "TABLE_LABELS",
     "OKF_DIRECTORY",
+    "EXCLUDE_DB_OWNER_PATTERN",
 ]
 
 OUTPUT_DIR = OKF_DIRECTORY
@@ -164,6 +167,7 @@ def apply_runtime_config(cli_args):
     global TABLE_SCD_COUNT
     global TABLE_LABELS
     global OKF_DIRECTORY
+    global EXCLUDE_DB_OWNER_PATTERN
     global OUTPUT_DIR
     global TABLES_DIR
 
@@ -179,6 +183,7 @@ def apply_runtime_config(cli_args):
     TABLE_SCD_COUNT = resolve_setting(cli_args, "TABLE_SCD_COUNT")
     TABLE_LABELS = resolve_setting(cli_args, "TABLE_LABELS")
     OKF_DIRECTORY = resolve_setting(cli_args, "OKF_DIRECTORY")
+    EXCLUDE_DB_OWNER_PATTERN = resolve_setting(cli_args, "EXCLUDE_DB_OWNER_PATTERN")
 
     OUTPUT_DIR = OKF_DIRECTORY
     TABLES_DIR = os.path.join(OUTPUT_DIR, "tables")
@@ -196,6 +201,7 @@ def print_effective_config():
     logging.info(f"- TABLE_SCD_COUNT: {normalize_text(TABLE_SCD_COUNT, '<not set>')}")
     logging.info(f"- TABLE_LABELS: {normalize_text(TABLE_LABELS, '<not set>')}")
     logging.info(f"- OKF_DIRECTORY: {normalize_text(OUTPUT_DIR, '<not set>')}")
+    logging.info(f"- EXCLUDE_DB_OWNER_PATTERN: {normalize_text(EXCLUDE_DB_OWNER_PATTERN, '<not set>')}")
 
 def get_teradata_connection():
     try:
@@ -1194,6 +1200,173 @@ timestamp: {current_time}
 
     return md
 
+def fetch_database_metadata(cursor):
+    """Fetches database metadata, excluding databases by owner pattern."""
+    logging.info("Extracting database metadata...")
+    db_filter, db_params = build_like_filter("DatabaseName", SOURCE_DB_PATTERN)
+    exclude_filter, exclude_params = build_like_filter("OwnerName", EXCLUDE_DB_OWNER_PATTERN)
+
+    if "ANY" in exclude_filter:
+        exclude_filter = "NOT " + exclude_filter
+    else:
+        exclude_filter = exclude_filter.replace("LIKE", "NOT LIKE")
+
+    query = f"""
+    SELECT
+        DatabaseName,
+        CreatorName,
+        OwnerName,
+        DBKind,
+        PermSpace,
+        SpoolSpace,
+        TempSpace,
+        CommentString,
+        CreateTimeStamp,
+        LastAlterTimeStamp
+    FROM DBC.DatabasesV
+    WHERE {db_filter} AND {exclude_filter}
+    ORDER BY DatabaseName;
+    """
+    try:
+        cursor.execute(query, db_params + exclude_params)
+        columns = [desc[0] for desc in cursor.description]
+        rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+        logging.info(f"Fetched {len(rows)} database metadata rows.")
+        return rows
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else "unknown error"
+        logging.error(f"Error reading database metadata: {first_line}")
+        return []
+
+def fetch_db_historical_growth(cursor, db_name):
+    """
+    Fetches 90-day historical database size from PDCR, pivoted by week.
+    Returns the raw query and the fetched data row.
+    """
+    query = """WITH WeeklySpace AS (
+SELECT
+    DatabaseName,
+    LogDate AS Week_Ending_Saturday,
+    (TD_SATURDAY(CURRENT_DATE)-LogDate)/7 AS WeeksAgo,
+    CAST(MAX(CURRENTPERM) / 1024.0 / 1024.0 / 1024.0 AS DECIMAL(18,2)) AS Week_Size_GB
+FROM pdcrinfo.DatabaseSpace_Hst
+WHERE DatabaseName = ?
+  AND LogDate >= TD_SATURDAY(CURRENT_DATE - 90) AND LogDate = TD_SATURDAY(Logdate) AND LOGDATE <= TD_SATURDAY(CURRENT_DATE)
+GROUP BY 1, 2, 3
+),
+WindowStats AS (
+SELECT
+    DatabaseName,
+    WeeksAgo,
+    Week_Size_GB,
+    AVG(Week_Size_GB) OVER (PARTITION BY DatabaseName) AS Average_Size_GB,
+    FIRST_VALUE(Week_Size_GB) OVER (PARTITION BY DatabaseName ORDER BY WeeksAgo) AS First_Size_GB,
+    FIRST_VALUE(Week_Size_GB) OVER (PARTITION BY DatabaseName ORDER BY WeeksAgo DESC) AS Last_Size_GB
+FROM WeeklySpace
+)
+SELECT
+    CAST(MAX(CASE WHEN WeeksAgo = 0 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_0_Current_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 1 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_1_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 2 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_2_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 3 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_3_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 4 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_4_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 5 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_5_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 6 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_6_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 7 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_7_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 8 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_8_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 9 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_9_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 10 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_10_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 11 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_11_Ago_GB,
+    CAST(MAX(CASE WHEN WeeksAgo = 12 THEN Week_Size_GB END) AS DECIMAL(18,2)) AS Wk_12_Ago_GB,
+    MAX(Average_Size_GB) AS Average_Size_GB,
+    MAX(First_Size_GB) AS First_Size_GB,
+    MAX(Last_Size_GB) AS Last_Size_GB,
+    CAST(MAX(First_Size_GB) - MAX(Last_Size_GB) AS DECIMAL(18,2)) AS Size_Diff_GB
+FROM WindowStats;"""
+    try:
+        cursor.execute(query, [db_name])
+        columns = [desc[0] for desc in cursor.description]
+        row = cursor.fetchone()
+        if row:
+            return query, dict(zip(columns, row))
+        return query, None
+    except Exception as e:
+        first_line = str(e).splitlines()[0] if str(e) else "unknown error"
+        logging.warning(f"Could not read historical growth for database {db_name}: {first_line}")
+        return query, None
+
+def generate_database_okf_markdown(db_info, growth):
+    db_name = db_info.get('DatabaseName')
+    db_kind_code = db_info.get('DBKind', 'D')
+    db_kind = "user" if normalize_text(db_kind_code).upper() == 'U' else "database"
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    
+    desc = normalize_text(db_info.get('CommentString'), "No description provided.")
+    safe_desc = desc.replace('"', '\\"').replace('\n', '\\n').replace('\r', '')
+    yaml_desc_line = f'description: "{safe_desc}"\n' if db_info.get('CommentString') else ""
+    
+    created = format_iso_utc(db_info.get('CreateTimeStamp'))
+    altered = format_iso_utc(db_info.get('LastAlterTimeStamp'))
+    
+    perm = db_info.get('PermSpace')
+    perm_str = f"`{format_number(perm)} bytes ({human_size(perm)})`" if perm is not None else "Unknown"
+    
+    md = f"---"
+    md += f"\ntype: teradata {db_kind}"
+    md += f"\ntitle: \"{db_name}\""
+    if yaml_desc_line:
+        md += f"\n{yaml_desc_line.strip()}"
+    md += f"\ntags:\n  - {db_name.lower()}\n  - teradata\n  - {db_kind}"
+    md += f"\ntimestamp: {current_time}"
+    md += f"\n---\n\n"
+    
+    md += f"# Database: {db_name}\n\n"
+    md += f"**Object Type:** `{db_kind.capitalize()} ({db_kind_code})`\n"
+    md += f"**Owner:** `{normalize_text(db_info.get('OwnerName'))}`\n"
+    md += f"**Creator:** `{normalize_text(db_info.get('CreatorName'))}`\n"
+    md += f"**Created:** `{created}`\n"
+    md += f"**Last Altered:** `{altered}`\n"
+    md += f"**Perm Space:** {perm_str}\n\n"
+    
+    md += f"**Description:** {desc}\n\n"
+    
+    # Historical Growth Section
+    md += "## Historical Growth\n\n"
+    growth_data = growth['data']
+    source_query = growth['query']
+    
+    if not growth_data:
+        md += "No historical size data available in `pdcrinfo.DatabaseSpace_Hst` for this database.\n"
+    else:
+        md += "Weekly peak database size (GB) over the last 90 days. Week 0 is the most recent week.\n\n"
+        md += "| Metric | Value |\n"
+        md += "| :--- | :--- |\n"
+        md += f"| 90-Day Avg Size (GB) | `{format_number(growth_data.get('Average_Size_GB'))}` |\n"
+        md += f"| 90-Day Growth (GB) | `{format_number(growth_data.get('Size_Diff_GB'))}` |\n"
+        md += "\n"
+        md += "| Wk 0 | Wk 1 | Wk 2 | Wk 3 | Wk 4 | Wk 5 | Wk 6 |\n"
+        md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        md += (
+            f"| {format_number(growth_data.get('Wk_0_Current_GB'))} | {format_number(growth_data.get('Wk_1_Ago_GB'))} | "
+            f"{format_number(growth_data.get('Wk_2_Ago_GB'))} | {format_number(growth_data.get('Wk_3_Ago_GB'))} | "
+            f"{format_number(growth_data.get('Wk_4_Ago_GB'))} | {format_number(growth_data.get('Wk_5_Ago_GB'))} | "
+            f"{format_number(growth_data.get('Wk_6_Ago_GB'))} |\n"
+        )
+        md += "\n"
+        md += "| Wk 7 | Wk 8 | Wk 9 | Wk 10 | Wk 11 | Wk 12 |\n"
+        md += "| :--- | :--- | :--- | :--- | :--- | :--- |\n"
+        md += (
+            f"| {format_number(growth_data.get('Wk_7_Ago_GB'))} | {format_number(growth_data.get('Wk_8_Ago_GB'))} | "
+            f"{format_number(growth_data.get('Wk_9_Ago_GB'))} | {format_number(growth_data.get('Wk_10_Ago_GB'))} | "
+            f"{format_number(growth_data.get('Wk_11_Ago_GB'))} | {format_number(growth_data.get('Wk_12_Ago_GB'))} |\n"
+        )
+        
+    md += "\n<details><summary>Source Query</summary>\n\n```sql\n"
+    safe_query = source_query.replace("= ?", f"= '{db_name}'", 1)
+    md += safe_query + "\n```\n</details>\n"
+    
+    return md
+
 def generate_bundle_indices(tables, output_dir, tables_dir):
     """Generates the root index.md and individual database index.md files."""
     logging.info("Generating OKF index files...")
@@ -1365,10 +1538,37 @@ def main():
     print_effective_config()
 
     os.makedirs(TABLES_DIR, exist_ok=True)
+    
+    DATABASES_DIR = os.path.join(OUTPUT_DIR, "databases")
+    os.makedirs(DATABASES_DIR, exist_ok=True)
+
     conn = get_teradata_connection()
     cursor = conn.cursor()
     
     try:
+        # 1. Fetch and Generate Database Metadata
+        db_rows = fetch_database_metadata(cursor)
+        for db_info in db_rows:
+            db_name = db_info.get('DatabaseName')
+            if not db_name:
+                continue
+                
+            growth_query, growth_data = fetch_db_historical_growth(cursor, db_name)
+            md_content = generate_database_okf_markdown(
+                db_info, 
+                {'query': growth_query, 'data': growth_data}
+            )
+            
+            safe_db_name = db_name.replace(" ", "_").replace('"', '')
+            db_dir = os.path.join(DATABASES_DIR, safe_db_name)
+            os.makedirs(db_dir, exist_ok=True)
+            
+            filepath = os.path.join(db_dir, f"{safe_db_name}_metadata.md")
+            logging.info(f"Writing database OKF file to {filepath}")
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(md_content)
+
+        # 2. Fetch and Generate Table Metadata
         master_rows = fetch_master_metadata(cursor)
         index_rows = fetch_indices(cursor)
         partition_rows = fetch_partitioning(cursor)
